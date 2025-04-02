@@ -1,51 +1,76 @@
 # ComfyUI-PuLID-Flux-Enhanced
-adapted from https://github.com/balazik/ComfyUI-PuLID-Flux
+改编自 https://github.com/balazik/ComfyUI-PuLID-Flux
 
-workflow: see example flux_pulid_multi.json
+工作流示例: 参见 flux_pulid_multi.json
 
-## update oct.28 2024
-Add an optional prior image input for the node. When using the train_weight method, the prior image will act as the main id image, which will lead the other id images to sum up to an optimized id embedding.
+## 2025年4月2日更新
 
-This prior was randomly choosen previously, now we can assign it.
+### 高级身份保持和姿势解耦
 
-Leaving the prior image input empty is OK just as previous.
+添加了两种强大的新方法，在保持更好的姿势控制的同时提供更好的身份保持：
 
-Please choose the best id image in your mind as the prior, or just experiment around and see what happens.
+ 
+
+1. **自适应通道选择（Adaptive）** - 基于特征相关性分析动态识别哪些特征通道与姿势或身份相关。这种方法比固定通道策略提供更精确的姿势解耦，能够自动适应不同的模型和图像。
+
+2. **残差连接方法（Residual）** - 实现了InfiniteYou方法的简化版本，直接添加身份特征而不是使用正交投影。这种方法通常产生更高保真度的结果，同时仍然保持良好的姿势变化。
+
+ 
+
+这些新方法可以通过节点界面中的“方法”下拉菜单选择。现在提供三种选项：
+- **保真度（Fidelity）**：经典方法，专注于身份保持
+- **自适应（Adaptive）**：动态特征通道分析，实现更好的姿势解耦
+- **残差（Residual）**：使用加权残差连接，实现增强的身份保持
+
+![adaptive_residual_comparison](https://github.com/user-attachments/assets/comparison_placeholder.jpg)
+
+## 2024年10月28日更新
+添加了一个可选的先验图像输入。使用训练权重方法时，先验图像将作为主要身份图像，其他身份图像将汇总为一个优化的身份嵌入。
+
+之前，先验图像是随机选择的，现在可以手动指定。
+
+如果不指定先验图像输入，也可以正常使用。
+
+请选择您认为最好的身份图像作为先验图像，或者尝试不同的图像看看会发生什么。
 ![oct28](https://github.com/user-attachments/assets/6a481cd9-2836-4f6f-9ad5-7458356c332a)
 
-## new features
-### common fusion methods for multi-image input
-mean(official), concat, max...etc
+## 新功能
+### 多图像输入的通用融合方法
+平均（官方）、拼接、最大值等
 
-### some further experimental fusion methods.
-using the norm of the conditions to weight them
+### 一些进一步的实验性融合方法
+使用条件的范数进行加权
 
-using the max norm token among images
+使用图像之间的最大范数令牌
 
-a novel very fast embeddings self-training methods(explained here: https://github.com/balazik/ComfyUI-PuLID-Flux/issues/28)
+一种全新的、非常快速的嵌入自训练方法（详见：https://github.com/balazik/ComfyUI-PuLID-Flux/issues/28）
 
-### switch between using gray image (official) and rgb.
-in some cases, using gray image will bring detail loss
+### 在灰度图像（官方）和RGB图像之间切换
+在某些情况下，使用灰度图像会导致细节丢失
 
 ![2024-10-12_204047](https://github.com/user-attachments/assets/0ae96170-2eff-44e9-a53a-6a7447dbc0f1)
 
-## tricks make your generation better
-### fusion method leverages many id images to enhance fidelity
-1. Besides mean fusion, you can try max or max_token, which can boost some major feature of a face (like large eyes, special nose or sth). it can go distortion beyond fidelity though.
-2. With train_weight method, you can train with less than 2000 steps to make a deeper fusion than the non-training methods. Be aware too many training steps will make the training crash to the prior image.
+## 提高生成质量的技巧
+### 融合方法利用多个身份图像增强保真度
+1. 除了平均融合外，还可以尝试最大值或最大令牌，这些方法可以增强面部某些特征（如大眼睛、特殊鼻子等）。但是，这可能会导致失真超过保真度。
+2. 使用训练权重方法，可以在2000步以下训练得到比非训练方法更深的融合。注意，过多的训练步骤会导致训练崩溃到先验图像。
 
-### additional notes
-1. Flux is a high capacity base model, it even can cognize the input image in some super human way. 
-for example, you can resize your high quality input image with lanczos method rather than nearest area or billinear. you get finer texture. Keep in mind that taking care of your input image is the thing when the base model is strong.
-2. The best pulid weight is around 0.8-0.95 for flux pulid 0.9.0. 1.0 is not good. For 0.9.1, it's higher towards around 0.9-1.0. Nonetheless the 0.9.1 is not always better than 0.9.0.
-3. The base model is flux-dev or its finetuning, and the precision does mean the thing. fp16 should always be sound. fp8 is OK. I won't recommend gguf or nf4 things.
-4. Some of the finetuned flux dev model may have strong bias. for example, it may sway the faces to a certain human race.
-5. Euler simple is always working. Euler beta give you higher quality especially if your input image is somewhat low quality.
-6. If you wanna use 3rd party flux-d weight, better to use a merged one or with a lora weight, rather than a finetuned one. Full finetuning can hurt the connection between pulid and original flux-d base model. You can test by yourself though. 
+### 新的自适应和残差方法的提示
+1. **自适应方法**在需要保持提示和参考图像之间明显姿势差异时效果最佳。它特别适合于较强的引导比例。
+2. **残差方法**通常提供最高的身份保真度，同时仍然允许姿势变化。尝试稍微增加权重（0.9-1.1）时使用此方法。
+3. 将任一方法与融合技术结合使用，可以产生更好的结果，尤其是当使用多个参考图像时。
 
-## basic notes for common users
-This is an experimental node. It can give enhanced result but I'm not promising basic instructions for users who barely know about python developing or AI developing.
+### 附加说明
+1.  Flux是一个高容量的基础模型，它甚至可以以超人类的方式认知输入图像。例如，可以使用Lanczos方法而不是最近邻域或双线性方法来调整高质量输入图像的大小，从而获得更细腻的纹理。请记住，当基础模型强大时，输入图像的质量就是关键。
+2. 最佳的PuLID权重在0.8-0.95之间，对于Flux PuLID 0.9.0来说，1.0不是一个好的选择。对于0.9.1来说，权重更高，接近0.9-1.0。然而，0.9.1并不总是比0.9.0更好。
+3. 基础模型是Flux-dev或其微调版本，精度确实很重要。FP16始终是安全的，FP8也是可以接受的。我不推荐使用GGUF或NF4等方法。
+4. 一些微调的Flux-dev模型可能具有强烈的偏见。例如，它可能会将面部倾向于某个人类种族。
+5. 简单的Euler方法始终有效。Euler beta方法可以提供更高质量的结果，特别是当输入图像质量较低时。
+6. 如果要使用第三方Flux-d权重，最好使用合并权重或带有LoRA权重的权重，而不是微调权重。完整的微调可能会损害PuLID和原始Flux-d基础模型之间的连接。您可以自己进行测试。
 
-Please follow the comfyui instructions or https://github.com/balazik/ComfyUI-PuLID-Flux to enable usage.
+## 普通用户的基本说明
+这是一个实验性节点。它可以提供增强的结果，但我不保证为不了解Python开发或AI开发的用户提供基本说明。
 
-If you are just using SDXL pulid, you can use https://github.com/cubiq/PuLID_ComfyUI. Some of the installation instructions there may also help.
+请遵循ComfyUI的说明或 https://github.com/balazik/ComfyUI-PuLID-Flux 启用使用。
+
+如果您只使用SDXL PuLID，可以使用 https://github.com/cubiq/PuLID_ComfyUI。那里的一些安装说明也可能有所帮助。
