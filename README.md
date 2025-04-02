@@ -4,6 +4,10 @@
 
 部分思路借鉴：https://github.com/balazik/ComfyUI-PuLID-Flux
 
+![微信截图_20250402175311](https://github.com/user-attachments/assets/53586740-0563-48c5-b463-58688b3e5f30)
+![微信截图_20250402174710](https://github.com/user-attachments/assets/f37d718c-a99c-42a4-a5e2-3743283c5970)
+
+
 ## 核心功能
 
 ### 高级身份保持和姿势解耦方法
