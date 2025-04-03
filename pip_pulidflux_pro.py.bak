@@ -1,0 +1,1161 @@
+# Enhanced PIP-PuLID-Flux with Multi-Person Support
+# This extends the original PIP-PuLID-Flux with support for multiple reference images and attention-guided application
+
+from .pip_pulidflux import ApplyPulidFlux, PipApplyPulidFlux
+import torch
+import comfy
+import numpy as np
+from torchvision import transforms
+from torchvision.transforms import functional
+import logging
+from facexlib.utils.face_restoration_helper import FaceRestoreHelper
+from facexlib.parsing import init_parsing_model
+# Import helper functions from the original module
+from .pulidflux import tensor_to_image, image_to_tensor, resize_with_pad, to_gray, online_train
+import math
+import torch.nn.functional as F
+
+class PipApplyPulidFluxPro(PipApplyPulidFlux):
+    """Professional version of PIP-PuLID-Flux with multi-person support
+    
+    This class extends PipApplyPulidFlux with capabilities to handle multiple reference images
+    and map them to different people in the scene based on attention maps from text prompts.
+    """
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL", ),
+                "pulid_flux": ("PULIDFLUX", ),
+                "eva_clip": ("EVA_CLIP", ),
+                "face_analysis": ("FACEANALYSIS", ),
+                "image_a": ("IMAGE", ),  # First reference image
+                "method_a": (["fidelity", "adaptive", "residual", "pose_free", "slerp"],),  # Method for first reference
+                "person_a_token": ("STRING", {"default": "person A", "multiline": False}),  # Text token for identifying person A
+                "weight_a": ("FLOAT", {"default": 1.0, "min": -1.0, "max": 5.0, "step": 0.05 }),
+                "start_at": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001 }),
+                "end_at": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001 }),
+                "prompt_text": ("STRING", {"default": "", "multiline": True}),  # Complete prompt text input
+            },
+            "optional": {
+                "attn_mask": ("MASK", ),
+                "image_b": ("IMAGE",),  # Second reference image (optional)
+                "method_b": (["fidelity", "adaptive", "residual", "pose_free", "slerp"],),  # Method for second reference
+                "person_b_token": ("STRING", {"default": "person B", "multiline": False}),  # Text token for identifying person B
+                "weight_b": ("FLOAT", {"default": 1.0, "min": -1.0, "max": 5.0, "step": 0.05 }),
+                "fusion": (["auto", "mean", "concat", "max", "norm_id", "max_token", "auto_weight", "train_weight"],),
+                "fusion_weight_max": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 20.0, "step": 0.1 }),
+                "fusion_weight_min": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 20.0, "step": 0.1 }),
+                "train_step": ("INT", {"default": 1000, "min": 0, "max": 20000, "step": 1 }),
+                "use_gray": ("BOOLEAN", {"default": True, "label_on": "enabled", "label_off": "disabled"}),
+                "attention_threshold": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0, "step": 0.05 }),  # Threshold for attention map
+            },
+            "hidden": {
+                "unique_id_a": "UNIQUE_ID",
+                "unique_id_b": "UNIQUE_ID"
+            },
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "apply_pip_pulid_flux_pro"
+    CATEGORY = "pulid"
+
+    def apply_pip_pulid_flux_pro(self, model, pulid_flux, eva_clip, face_analysis, 
+                              image_a, method_a, person_a_token, weight_a, 
+                              start_at, end_at, prompt_text, attn_mask=None, 
+                              image_b=None, method_b=None, person_b_token=None, weight_b=None,
+                              fusion=None, fusion_weight_max=1.0, fusion_weight_min=0.0, 
+                              train_step=1000, use_gray=True, attention_threshold=0.4,
+                              unique_id_a=None, unique_id_b=None):
+        
+        print(f"\n[PIP-PuLID-PRO] Initializing multi-person PuLID application")
+        print(f"[PIP-PuLID-PRO] Got prompt: {prompt_text}")
+        
+        # Store attention tokens for later use in the forward pass
+        self.attention_tokens = {
+            "a": person_a_token.strip(),
+            "b": person_b_token.strip() if person_b_token is not None else None
+        }
+        
+        # Store the full prompt text for attention guidance
+        self.prompt_text = prompt_text.strip()
+        
+        # 增强令牌映射，捕获上下文信息
+        self.enhanced_tokens = self.enhance_person_token_mapping(self.prompt_text, self.attention_tokens)
+        print(f"[PIP-PuLID-PRO] Enhanced token mapping with context information")
+        
+        # Get the model's diffusion model to store properties directly on it
+        flux_model = model.model.diffusion_model
+        
+        # Store both prompt text and attention tokens directly on the model
+        flux_model.prompt_text = self.prompt_text
+        flux_model.attention_tokens = self.attention_tokens
+        flux_model.attention_threshold = attention_threshold
+        
+        self.attention_threshold = attention_threshold
+        
+        # Process first reference
+        model = self._apply_reference(model, pulid_flux, eva_clip, face_analysis, 
+                                     image_a, method_a, weight_a, start_at, end_at,
+                                     attn_mask, fusion, fusion_weight_max, fusion_weight_min,
+                                     train_step, use_gray, unique_id_a, "a")
+        
+        # Process second reference if provided
+        if image_b is not None and method_b is not None and person_b_token is not None and weight_b is not None:
+            model = self._apply_reference(model, pulid_flux, eva_clip, face_analysis, 
+                                         image_b, method_b, weight_b, start_at, end_at,
+                                         attn_mask, fusion, fusion_weight_max, fusion_weight_min,
+                                         train_step, use_gray, unique_id_b, "b")
+        
+        return (model,)
+    
+    def _apply_reference(self, model, pulid_flux, eva_clip, face_analysis, image, method, weight, 
+                        start_at, end_at, attn_mask, fusion, fusion_weight_max, fusion_weight_min, 
+                        train_step, use_gray, unique_id, person_id):
+        
+        # Configure method parameters as in the original implementation
+        ortho = False
+        ortho_v2 = False
+        adaptive = False
+        residual = False
+        
+        if method == "fidelity":
+            ortho_v2 = True
+            fusion = "norm_id" if fusion is None or fusion == "auto" else fusion
+        elif method == "adaptive":
+            adaptive = True
+            fusion = "concat" if fusion is None or fusion == "auto" else fusion
+        elif method == "residual":
+            residual = True
+            fusion = "max" if fusion is None or fusion == "auto" else fusion
+        elif method == "pose_free":
+            # 姿势解耦方法，使用特化的正交投影
+            ortho_v2 = True
+            # 将这个设置为类属性，直接传递到网络中
+            self.pose_free_mode = True
+            # 定义一个更强的正交因子，专门用于前1/3的位置特征通道
+            self.pose_orthogonal_factor = 3.5
+            fusion = "norm_id" if fusion is None or fusion == "auto" else fusion
+            print(f"[PIP-PuLID-PRO] Using pose_free mode with orthogonal factor {self.pose_orthogonal_factor}")
+        elif method == "slerp":
+            # Slerp插值方法，用于平滑混合多个身份
+            self.slerp_mode = True
+            # 定义Slerp的混合因子
+            self.slerp_smooth_factor = 0.3
+            fusion = "norm_id" if fusion is None or fusion == "auto" else fusion
+            print(f"[PIP-PuLID-PRO] Using Slerp interpolation with smooth factor {self.slerp_smooth_factor}")
+        else:  # neutral
+            fusion = "concat" if fusion is None or fusion == "auto" else fusion
+            
+        print(f"[PIP-PuLID-PRO] Person {person_id.upper()}: method={method}, fusion={fusion}, token='{self.attention_tokens[person_id]}'")
+        
+        # Prepare device and type information
+        device = comfy.model_management.get_torch_device()
+        dtype = model.model.diffusion_model.dtype
+        if dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+            dtype = torch.bfloat16
+
+        # Extract the FluxModel
+        flux_model = model.model.diffusion_model
+        
+        # Calculate sigma values
+        sigma_start = start_at
+        sigma_end = end_at
+        
+        # Process the reference image
+        cond = self._process_reference_image(pulid_flux, eva_clip, face_analysis, image, fusion, 
+                                           fusion_weight_max, fusion_weight_min, train_step, use_gray, 
+                                           device, dtype)
+        
+        # Define the attention-guided forward_orig function
+        def forward_orig_with_attention_guidance(self, img, img_ids=None, context=None, txt_ids=None, timestep=None, y=None, guidance=None, control=None, transformer_options={}, attn_mask=None, **kwargs):
+            # DEBUG: Print input parameters
+            print(f"[DEBUG-PuLID] forward_orig_with_attention_guidance called with img shape: {img.shape if img is not None else None}")
+            print(f"[DEBUG-PuLID] timestep: {timestep}, context shape: {context.shape if context is not None else None}")
+            print(f"[DEBUG-PuLID] transformer_options keys: {list(transformer_options.keys()) if transformer_options else None}")
+            
+            # Get the original forward_orig method 
+            # Using the original_forward_orig method to avoid recursion
+            if hasattr(self, 'original_forward_orig'):
+                forward_orig_fn = self.original_forward_orig
+                print(f"[DEBUG-PuLID] Using original_forward_orig method")
+            else:
+                # Prevent circular reference by getting the parent class's method
+                from inspect import getmro
+                for cls in getmro(self.__class__)[1:]:  # Skip the current class
+                    if hasattr(cls, 'forward_orig'):
+                        forward_orig_fn = getattr(cls, 'forward_orig').__get__(self, cls)
+                        print(f"[DEBUG-PuLID] Found forward_orig in parent class: {cls.__name__}")
+                        break
+                else:
+                    # Fallback: this should never happen if properly initialized
+                    print("[PIP-PuLID-PRO] WARNING: Could not find original forward_orig, identity function used")
+                    return img  # Return input as fallback
+            
+            # Extract the resulting latent from the original forward_orig method
+            try:
+                print(f"[DEBUG-PuLID] Calling original forward_orig method")
+                img_out = forward_orig_fn(img, img_ids, context, txt_ids, timestep, y, guidance, control, transformer_options, attn_mask, **kwargs)
+                print(f"[DEBUG-PuLID] forward_orig returned shape: {img_out.shape if img_out is not None else None}")
+                
+                if img_out is None:
+                    print("[PIP-PuLID-PRO] WARNING: Original forward_orig returned None, using input")
+                    img_out = img  # Fallback to input
+            except Exception as e:
+                print(f"[PIP-PuLID-PRO] ERROR in original forward_orig: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                return img  # Return input as fallback on error
+            
+            # Use timestep as t for sigma value comparison
+            t = timestep
+            
+            # DEBUG: Check attention maps state
+            print(f"[DEBUG-PuLID] Has pulid_data: {hasattr(self, 'pulid_data')}")
+            print(f"[DEBUG-PuLID] Has attention_maps: {hasattr(self, 'attention_maps')}")
+            if hasattr(self, 'attention_maps'):
+                print(f"[DEBUG-PuLID] attention_maps keys: {list(self.attention_maps.keys())}")
+            
+            # Use t directly from parameters
+            # Apply PuLID with attention guidance
+            if hasattr(self, "pulid_data") and self.pulid_data and hasattr(self, "attention_maps") and self.attention_maps:
+                print(f"[DEBUG-PuLID] Processing PuLID data with attention: {len(self.pulid_data)} entries")
+                
+                # Extract cross-attention maps if available
+                cross_attention_maps = {}
+                if transformer_options and 'cross_attention_kwargs' in transformer_options:
+                    attn_kwargs = transformer_options['cross_attention_kwargs']
+                    print(f"[DEBUG-PuLID] cross_attention_kwargs keys: {list(attn_kwargs.keys())}")
+                    
+                    # 获取当前层信息
+                    current_layer_info = None
+                    if 'current_layer' in attn_kwargs:
+                        current_layer_info = attn_kwargs['current_layer']
+                        print(f"[DEBUG-PuLID] Current layer: {current_layer_info}")
+                    
+                    # 为不同的层设置不同的权重乘数
+                    layer_weight_multipliers = {
+                        # 下采样块 - 控制结构和整体布局
+                        'down_blocks.0': 0.7,  # 第一个下采样层 - 主要影响整体构图
+                        'down_blocks.1': 0.9,  # 第二个下采样层 - 主要影响中等尺度结构
+                        'down_blocks.2': 1.1,  # 第三个下采样层 - 更多语义信息
+                        'down_blocks.3': 1.2,  # 第四个下采样层 - 更精细的语义特征
+                        
+                        # 中间块 - 最丰富的语义信息
+                        'mid_block': 1.5,      # 中间层通常包含最丰富的语义信息
+                        
+                        # 上采样块 - 控制细节和纹理
+                        'up_blocks.0': 1.2,    # 第一个上采样层 - 较高层次特征
+                        'up_blocks.1': 1.0,    # 第二个上采样层 - 中等细节
+                        'up_blocks.2': 0.8,    # 第三个上采样层 - 更精细的细节
+                        'up_blocks.3': 0.6,    # 第四个上采样层 - 最精细的纹理细节
+                    }
+                    
+                    # 获取默认权重乘数（如果未找到层信息）
+                    default_weight_multiplier = 1.0
+                    
+                    if 'maps' in attn_kwargs and len(attn_kwargs['maps']) > 0:
+                        # We have access to cross-attention maps
+                        cross_attn_maps = attn_kwargs['maps']
+                        print(f"[DEBUG-PuLID] Got {len(cross_attn_maps)} cross-attention maps")
+                        
+                        # 获取默认权重乘数
+                        weight_multiplier = default_weight_multiplier
+                        
+                        # 根据当前层更新权重乘数
+                        if current_layer_info:
+                            # 查找最匹配的层前缀
+                            for layer_prefix, multiplier in layer_weight_multipliers.items():
+                                if current_layer_info.startswith(layer_prefix):
+                                    weight_multiplier = multiplier
+                                    print(f"[DEBUG-PuLID] Using weight multiplier {weight_multiplier} for layer {current_layer_info}")
+                                    break
+                        
+                        # Loop through each person
+                        for uid, node_data in self.pulid_data.items():
+                            if 'person_id' in node_data and node_data['person_id'] in self.attention_maps:
+                                # Get the person's token and embedding
+                                person_id = node_data['person_id']
+                                person_token = self.attention_maps[person_id]['token']
+                                embedding = node_data['embedding']
+                                
+                                # 应用层特定的权重乘数
+                                original_weight = node_data['weight']
+                                adjusted_weight = original_weight * weight_multiplier
+                                
+                                print(f"[DEBUG-PuLID] Processing person {person_id} with token '{person_token}'")
+                                print(f"[DEBUG-PuLID] Original weight: {original_weight}, Adjusted weight: {adjusted_weight} (x{weight_multiplier})")
+                                
+                                sigma_start = node_data['sigma_start']
+                                sigma_end = node_data['sigma_end']
+                                
+                                print(f"[DEBUG-PuLID] Embedding shape: {embedding.shape}, sigma_range: {sigma_start}-{sigma_end}")
+                                # Also log method info for pose decoupling analysis
+                                adaptive = node_data.get('adaptive', False)
+                                ortho_v2 = node_data.get('ortho_v2', False)
+                                residual = node_data.get('residual', False)
+                                method_str = "adaptive" if adaptive else ("ortho_v2" if ortho_v2 else ("residual" if residual else "standard"))
+                                print(f"[DEBUG-PuLID] Using method: {method_str} (original weight: {original_weight}, adjusted: {adjusted_weight})")
+                                
+                                # Current sigma value
+                                sigma = t
+                                print(f"[DEBUG-PuLID] Current sigma: {sigma}, range check: {sigma_start >= sigma >= sigma_end}")
+                                
+                                # Check if we should apply PuLID at current timestep
+                                if sigma_start >= sigma >= sigma_end:
+                                    # Extract attention map - get max attention across all heads and layers
+                                    # for tokens related to this person
+                                    person_attn_map = None
+                                    
+                                    # Get the prompt text directly from the model
+                                    text_prompt = self.prompt_text if hasattr(self, 'prompt_text') else None
+                                    if text_prompt:
+                                        print(f"[DEBUG-PuLID] Text prompt: {text_prompt}")
+                                        
+                                        # Check if person token is in the prompt
+                                        if person_token in text_prompt:
+                                            print(f"[DEBUG-PuLID] Token '{person_token}' found in prompt")
+                                            # Get all cross-attention maps
+                                            if cross_attn_maps:
+                                                # Find token position in the prompt
+                                                token_pos = text_prompt.find(person_token)
+                                                if token_pos >= 0:
+                                                    # Convert to approximate token index (rough approximation)
+                                                    token_index = text_prompt[:token_pos].count(' ')
+                                                    print(f"[DEBUG-PuLID] Token index: {token_index} (position: {token_pos})")
+                                                    
+                                                    # Collect attention maps related to this token
+                                                    attn_map_count = 0
+                                                    for attn_map_idx, attn_map in enumerate(cross_attn_maps):
+                                                        if len(attn_map.shape) == 4:  # [batch, heads, h*w, tokens]
+                                                            print(f"[DEBUG-PuLID] Processing attention map {attn_map_idx} with shape: {attn_map.shape}")
+                                                            # Get attention for this token, across all heads
+                                                            token_attn = attn_map[0, :, :, token_index:token_index+5].mean(dim=0).mean(dim=-1)
+                                                            
+                                                            # Reshape to spatial dimensions
+                                                            h = w = int(math.sqrt(token_attn.shape[0]))
+                                                            token_attn = token_attn.reshape(h, w)
+                                                            print(f"[DEBUG-PuLID] Reshaped attention to {h}x{w}")
+                                                            
+                                                            # Create or update person attention map
+                                                            if person_attn_map is None:
+                                                                person_attn_map = token_attn
+                                                            else:
+                                                                person_attn_map = torch.maximum(person_attn_map, token_attn)
+                                                            attn_map_count += 1
+                                                    
+                                                    # 使用增强的上下文信息进一步提高注意力图
+                                                    if hasattr(self, 'enhanced_tokens') and person_id in self.enhanced_tokens:
+                                                        enhanced_token_info = self.enhanced_tokens[person_id]
+                                                        
+                                                        # 处理描述词
+                                                        if 'descriptors' in enhanced_token_info:
+                                                            descriptors = enhanced_token_info['descriptors']
+                                                            
+                                                            # 获取与位置和姿势相关的描述词
+                                                            position_words = []
+                                                            orientation_words = []
+                                                            
+                                                            if 'position' in descriptors:
+                                                                position_words = [item['word'] for item in descriptors['position']]
+                                                            
+                                                            if 'orientation' in descriptors:
+                                                                orientation_words = [item['word'] for item in descriptors['orientation']]
+                                                            
+                                                            # 如果找到相关描述词，尝试获取它们的注意力图
+                                                            if position_words or orientation_words:
+                                                                all_words = position_words + orientation_words
+                                                                print(f"[DEBUG-PuLID] Found position/orientation words: {', '.join(all_words)}")
+                                                                
+                                                                position_attn_map = None
+                                                                # 搜索这些词在文本中的位置
+                                                                for word in all_words:
+                                                                    word_pos = text_prompt.find(word)
+                                                                    if word_pos >= 0:
+                                                                        word_token_index = text_prompt[:word_pos].count(' ')
+                                                                        
+                                                                        # 对每个注意力图处理这个词
+                                                                        for attn_map_idx, attn_map in enumerate(cross_attn_maps):
+                                                                            if len(attn_map.shape) == 4:
+                                                                                # 获取这个词的注意力
+                                                                                word_attn = attn_map[0, :, :, word_token_index:word_token_index+1].mean(dim=0).mean(dim=-1)
+                                                                                
+                                                                                # 重塑为空间维度
+                                                                                h = w = int(math.sqrt(word_attn.shape[0]))
+                                                                                word_attn = word_attn.reshape(h, w)
+                                                                                
+                                                                                # 创建或更新位置注意力图
+                                                                                if position_attn_map is None:
+                                                                                    position_attn_map = word_attn
+                                                                                else:
+                                                                                    position_attn_map = torch.maximum(position_attn_map, word_attn)
+                                                                
+                                                                # 如果有位置注意力图，将其与人物注意力图结合
+                                                                if position_attn_map is not None and person_attn_map is not None:
+                                                                    print(f"[DEBUG-PuLID] Combining person attention with position/orientation attention")
+                                                                    # 给予位置词较小的权重但仍然考虑其影响
+                                                                    combined_attn_map = person_attn_map * 0.7 + position_attn_map * 0.3
+                                                                    person_attn_map = combined_attn_map
+                                                    
+                                                    print(f"[DEBUG-PuLID] Processed {attn_map_count} attention maps")
+                                                else:
+                                                    print(f"[DEBUG-PuLID] Token position not found for '{person_token}'")
+                                            else:
+                                                print(f"[DEBUG-PuLID] No cross-attention maps available")
+                                        else:
+                                            print(f"[DEBUG-PuLID] Token '{person_token}' not found in prompt")
+                                    else:
+                                        print(f"[DEBUG-PuLID] No text prompt available in transformer_options")
+                                    
+                                    # If we have an attention map for this person
+                                    if person_attn_map is not None:
+                                        print(f"[DEBUG-PuLID] Got attention map with shape: {person_attn_map.shape} and range: {person_attn_map.min().item():.4f}-{person_attn_map.max().item():.4f}")
+                                        
+                                        # Resize to match latent dimensions
+                                        batch_size, _, h, w = img_out.shape
+                                        person_attn_map = F.interpolate(
+                                            person_attn_map.unsqueeze(0).unsqueeze(0),
+                                            size=(h, w),
+                                            mode='bilinear',
+                                            align_corners=False
+                                        )[0, 0]
+                                        
+                                        # Apply threshold to create mask
+                                        threshold = getattr(self, 'attention_threshold', 0.4)
+                                        print(f"[DEBUG-PuLID] Using attention threshold: {threshold}")
+                                        person_mask = (person_attn_map > threshold).float()
+                                        person_mask = person_mask.to(device=img_out.device, dtype=img_out.dtype)
+                                        print(f"[DEBUG-PuLID] Created mask with shape: {person_mask.shape}, coverage: {person_mask.mean().item()*100:.2f}%")
+                                        
+                                        # Apply PuLID effect with the mask - person-specific identity injection
+                                        ortho = node_data.get('ortho', False)
+                                        ortho_v2 = node_data.get('ortho_v2', False)
+                                        adaptive = node_data.get('adaptive', False)
+                                        residual = node_data.get('residual', False)
+                                        
+                                        # Apply the actual PuLID transformation with attention mask
+                                        scale_factor = adjusted_weight  # 使用调整后的权重而不是原始权重
+                                        print(f"[DEBUG-PuLID] Scale factor: {scale_factor} (adjusted from {original_weight})")
+                                        
+                                        # 检查是否需要使用Slerp插值混合多个身份
+                                        if hasattr(self, 'slerp_mode') and self.slerp_mode:
+                                            # 查找是否有多个身份要应用到相同区域
+                                            embeds_for_slerp = []
+                                            weights_for_slerp = []
+                                            ids_for_slerp = []
+                                            
+                                            # 当前处理的身份先加入列表
+                                            embeds_for_slerp.append(embedding)
+                                            weights_for_slerp.append(adjusted_weight)
+                                            ids_for_slerp.append(person_id)
+                                            
+                                            # 检查是否有其他身份覆盖相同区域
+                                            overlap_threshold = 0.3  # 覆盖阈值，可以调整
+                                            
+                                            for other_uid, other_data in self.pulid_data.items():
+                                                if 'person_id' in other_data and other_data['person_id'] != person_id and other_data['person_id'] in self.attention_maps:
+                                                    other_person_id = other_data['person_id']
+                                                    
+                                                    # 获取其他人物的注意力图
+                                                    if hasattr(self.attention_maps[other_person_id], 'map') and self.attention_maps[other_person_id]['map'] is not None:
+                                                        other_attn_map = self.attention_maps[other_person_id]['map']
+                                                        
+                                                        # 将其他人物的注意力图调整为相同的尺寸
+                                                        if other_attn_map.shape != person_attn_map.shape:
+                                                            other_attn_map = F.interpolate(
+                                                                other_attn_map.unsqueeze(0).unsqueeze(0),
+                                                                size=person_attn_map.shape,
+                                                                mode='bilinear',
+                                                                align_corners=False
+                                                            )[0, 0]
+                                                        
+                                                        # 计算覆盖区域
+                                                        overlap = torch.logical_and(person_attn_map > threshold, other_attn_map > threshold).float()
+                                                        overlap_ratio = overlap.sum() / (person_attn_map > threshold).float().sum()
+                                                        
+                                                        if overlap_ratio > overlap_threshold:
+                                                            print(f"[DEBUG-PuLID] Found overlapping area with person {other_person_id}, overlap ratio: {overlap_ratio:.4f}")
+                                                            # 添加该身份的嵌入和权重
+                                                            other_emb = other_data['embedding'].to(device=img_out.device, dtype=img_out.dtype)
+                                                            other_weight = other_data['weight'] * getattr(self, 'weight_multiplier', weight_multiplier)
+                                                            
+                                                            embeds_for_slerp.append(other_emb)
+                                                            weights_for_slerp.append(other_weight)
+                                                            ids_for_slerp.append(other_person_id)
+                                            
+                                            # 如果有多个身份要混合
+                                            if len(embeds_for_slerp) > 1:
+                                                print(f"[DEBUG-PuLID] Applying Slerp interpolation for {len(embeds_for_slerp)} identities: {', '.join(ids_for_slerp)}")
+                                                
+                                                # 使用Slerp插值混合多个身份
+                                                smooth_factor = getattr(self, 'slerp_smooth_factor', 0.3)
+                                                blended_embedding = self.identity_slerp(embeds_for_slerp, weights_for_slerp, smooth_factor)
+                                                
+                                                # 使用混合后的嵌入向量替换原始的
+                                                print(f"[DEBUG-PuLID] Using Slerp-blended embedding with smooth factor {smooth_factor}")
+                                                embedding = blended_embedding
+                                        
+                                        emb = embedding.to(device=img_out.device, dtype=img_out.dtype)
+                                        print(f"[DEBUG-PuLID] Embedding shape after device/dtype conversion: {emb.shape}")
+                                        
+                                        # Create mask with proper dimensions
+                                        mask = person_mask.reshape(1, 1, h, w).expand(img_out.shape[0], -1, -1, -1)
+                                        print(f"[DEBUG-PuLID] Expanded mask shape: {mask.shape}")
+                                        
+                                        # Compute PuLID transformation
+                                        if ortho_v2 or adaptive or residual:
+                                            # Get the channel counts for adaptive orthogonal projection
+                                            c = img_out.shape[1]
+                                            if adaptive:
+                                                # Apply only to first third of channels (pose related)
+                                                c1 = c // 3
+                                                c2 = c
+                                                # Enhanced strength for pose decoupling
+                                                ortho_factor = 3.5
+                                                print(f"[DEBUG-PuLID] Using adaptive mode with ortho_factor: {ortho_factor}, channels: {c1}-{c2}")
+                                            else:
+                                                c1 = 0
+                                                c2 = c
+                                                ortho_factor = 1.0
+                                                print(f"[DEBUG-PuLID] Using regular mode with ortho_factor: {ortho_factor}, channels: {c1}-{c2}")
+                                            
+                                            # Apply PuLID with orthogonal projection
+                                            if residual:
+                                                # Residual-based application
+                                                print(f"[DEBUG-PuLID] Applying residual-based method")
+                                                try:
+                                                    emb_norm = torch.norm(emb, dim=1, keepdim=True)
+                                                    img_norm = torch.norm(img_out, dim=1, keepdim=True)
+                                                    # Calculate angle
+                                                    cos_sim = torch.sum(img_out * emb, dim=1, keepdim=True) / (emb_norm * img_norm + 1e-7)
+                                                    # Apply residual
+                                                    img_residual = img_out - cos_sim * img_norm * emb / (emb_norm + 1e-7)
+                                                    # Apply identity with mask
+                                                    img_out = img_out * (1 - mask) + (img_residual + scale_factor * emb) * mask
+                                                    print(f"[DEBUG-PuLID] Successfully applied residual method")
+                                                except Exception as e:
+                                                    print(f"[DEBUG-PuLID] ERROR in residual method: {e}")
+                                                    import traceback
+                                                    traceback.print_exc()
+                                            else:
+                                                # Orthogonal projection
+                                                print(f"[DEBUG-PuLID] Applying orthogonal projection")
+                                                try:
+                                                    img_c1 = img_out[:, c1:c2, :, :]
+                                                    emb_c1 = emb[:, c1:c2, :, :]
+                                                    
+                                                    # 检查是否处于pose_free模式
+                                                    pose_free_enabled = hasattr(self, 'pose_free_mode') and self.pose_free_mode
+                                                    
+                                                    # 根据是否是pose_free模式和当前处理的通道范围调整正交因子
+                                                    if pose_free_enabled and c1 < img_out.shape[1] // 3:
+                                                        # 使用增强的正交因子处理前1/3通道（姿势相关信息）
+                                                        enhanced_ortho_factor = getattr(self, 'pose_orthogonal_factor', 3.5)
+                                                        print(f"[DEBUG-PuLID] Using pose_free enhanced orthogonal factor: {enhanced_ortho_factor} for pose channels")
+                                                        ortho_factor = enhanced_ortho_factor
+                                                    
+                                                    # Calculate orthogonal component
+                                                    emb_norm = torch.norm(emb_c1, dim=1, keepdim=True) ** 2 + 1e-7
+                                                    proj = torch.sum(img_c1 * emb_c1, dim=1, keepdim=True) / emb_norm * emb_c1
+                                                    ortho = img_c1 - ortho_factor * proj
+                                                    # Apply transformed component with mask
+                                                    img_out[:, c1:c2, :, :] = img_c1 * (1 - mask[:, :, :, :]) + (ortho + scale_factor * emb_c1) * mask[:, :, :, :]
+                                                    print(f"[DEBUG-PuLID] Successfully applied orthogonal projection with factor {ortho_factor}")
+                                                except Exception as e:
+                                                    print(f"[DEBUG-PuLID] ERROR in orthogonal projection: {e}")
+                                                    import traceback
+                                                    traceback.print_exc()
+                                        else:
+                                            # Standard application (direct blend)
+                                            print(f"[DEBUG-PuLID] Applying standard direct blend")
+                                            try:
+                                                img_out = img_out * (1 - mask) + (img_out + scale_factor * emb) * mask
+                                                print(f"[DEBUG-PuLID] Successfully applied standard blend")
+                                            except Exception as e:
+                                                print(f"[DEBUG-PuLID] ERROR in standard blend: {e}")
+                                                import traceback
+                                                traceback.print_exc()
+                                        
+                                        # Log the application
+                                        print(f"[PIP-PuLID-PRO] Applying attention-guided PuLID for person {person_id.upper()} with token '{person_token}'")
+                    
+            return img_out
+
+        # Register the attention hook for this person if not already registered
+        if not hasattr(flux_model, 'attention_hooks_registered'):
+            flux_model.attention_hooks_registered = True
+            flux_model.attention_maps = {}
+            
+            # Patch the forward function to capture attention maps
+            original_forward = flux_model.forward
+            
+            def forward_with_attention_capture(self, x, t, context=None, control=None, transformer_options={}, **kwargs):
+                # Debug information before processing
+                print(f"[DEBUG-PuLID-CAPTURE] forward_with_attention_capture called with timestep: {t}")
+                print(f"[DEBUG-PuLID-CAPTURE] transformer_options type: {type(transformer_options)}")
+                print(f"[DEBUG-PuLID-CAPTURE] transformer_options keys: {list(transformer_options.keys()) if isinstance(transformer_options, dict) else 'not a dict'}")
+                
+                # Process transformer_options to set up cross-attention capture
+                if not isinstance(transformer_options, dict):
+                    print(f"[DEBUG-PuLID-CAPTURE] transformer_options is not a dict, converting from {type(transformer_options)}")
+                    # Convert to dict if it's not already
+                    transformer_options = dict(transformer_options) if hasattr(transformer_options, '__dict__') else {}
+                    
+                # Initialize cross_attention_kwargs if needed
+                if 'cross_attention_kwargs' not in transformer_options:
+                    transformer_options['cross_attention_kwargs'] = {}
+                    
+                # Initialize the map list for storing attention maps
+                if 'maps' not in transformer_options['cross_attention_kwargs']:
+                    transformer_options['cross_attention_kwargs']['maps'] = []
+                    
+                # Set the save_maps flag to capture cross-attention maps
+                transformer_options['cross_attention_kwargs']['save_maps'] = True
+                
+                # Use prompt_text directly from the model instance
+                if hasattr(self, 'prompt_text'):
+                    transformer_options['text'] = self.prompt_text
+                    print(f"[DEBUG-PuLID-CAPTURE] Using prompt_text from model: {transformer_options['text']}")
+                
+                # Debug what we've set up
+                print(f"[DEBUG-PuLID-CAPTURE] Set up cross_attention_kwargs: {transformer_options['cross_attention_kwargs']}")
+                
+                # Reset attention maps for this forward pass
+                self.attention_maps = {}
+                
+                # Use attention_tokens directly from the model instance
+                if hasattr(self, 'prompt_text') and hasattr(self, 'attention_tokens'):
+                    text_prompt = self.prompt_text
+                    print(f"[DEBUG-PuLID-CAPTURE] Using text prompt from model: {text_prompt}")
+                    
+                    # Register tokens for attention capture
+                    for person_id, token in self.attention_tokens.items():
+                        if token and token in text_prompt:
+                            self.attention_maps[person_id] = {'token': token, 'map': None}
+                            print(f"[DEBUG-PuLID-CAPTURE] Registered token '{token}' for person {person_id}")
+                
+                # Call original forward with proper arguments
+                result = original_forward(x, t, context=context, control=control, transformer_options=transformer_options, **kwargs)
+                
+                return result
+
+            # Apply the patched forward method
+            flux_model.forward = forward_with_attention_capture.__get__(flux_model, flux_model.__class__)
+            print(f"[PIP-PuLID-PRO] Registered attention-guided forward method")
+
+        # Save the original forward_orig method if not already saved
+        if not hasattr(flux_model, 'original_forward_orig'):
+            flux_model.original_forward_orig = flux_model.forward_orig
+
+        # Apply the patched forward_orig method
+        flux_model.forward_orig = forward_orig_with_attention_guidance.__get__(flux_model, flux_model.__class__)
+        print(f"[PIP-PuLID-PRO] Registered attention-guided forward method")
+        
+        # Initialize the pulid_data dictionary if it doesn't exist
+        if not hasattr(flux_model, 'pulid_data'):
+            flux_model.pulid_data = {}
+            # Update the forward_orig method
+            new_method = flux_model.forward_orig.__get__(flux_model, flux_model.__class__)
+            setattr(flux_model, 'forward_orig', new_method)
+            print(f"[PIP-PuLID-PRO] Applied forward_orig method")
+        
+        # Store the PuLID data with person identifier
+        flux_model.pulid_data[unique_id] = {
+            'weight': weight,
+            'embedding': cond,
+            'sigma_start': sigma_start,
+            'sigma_end': sigma_end,
+            'ortho': ortho,
+            'ortho_v2': ortho_v2,
+            'adaptive': adaptive,
+            'residual': residual,
+            'person_id': person_id,  # Add person identifier
+        }
+        
+        # Store PuLID data for cleanup
+        if not hasattr(self, 'pulid_data_dict') or self.pulid_data_dict is None:
+            self.pulid_data_dict = {}
+        self.pulid_data_dict[unique_id] = {
+            'data': flux_model.pulid_data, 
+            'unique_id': unique_id
+        }
+        
+        return model
+    
+    def _process_reference_image(self, pulid_flux, eva_clip, face_analysis, image, fusion, 
+                               fusion_weight_max, fusion_weight_min, train_step, use_gray, 
+                               device, dtype):
+        """Process the reference image to extract face embedding"""
+        # Ensure the eva_clip model is on the same device as our data
+        eva_clip.to(device)
+        
+        # Ensure the pulid_flux model is on the same device and uses the same dtype as our data
+        pulid_flux.pulid_encoder.to(device)
+        # Convert pulid_encoder's parameters to match our desired dtype
+        for param in pulid_flux.pulid_encoder.parameters():
+            param.data = param.data.to(dtype=dtype)
+        
+        # Prepare the image
+        image = tensor_to_image(image)
+
+        face_helper = FaceRestoreHelper(
+            upscale_factor=1,
+            face_size=512,
+            crop_ratio=(1, 1),
+            det_model='retinaface_resnet50',
+            save_ext='png',
+            device=device,
+        )
+
+        face_helper.face_parse = None
+        face_helper.face_parse = init_parsing_model(model_name='bisenet', device=device)
+
+        bg_label = [0, 16, 18, 7, 8, 9, 14, 15]
+        cond = []
+
+        # Process each image in the batch
+        for i in range(image.shape[0]):
+            # Get insightface embeddings
+            iface_embeds = None
+            for size in [(size, size) for size in range(640, 256, -64)]:
+                face_analysis.det_model.input_size = size
+                face_info = face_analysis.get(image[i])
+                if face_info:
+                    face_info = sorted(face_info, key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]))[-1]
+                    iface_embeds = torch.from_numpy(face_info.embedding).unsqueeze(0).to(device, dtype=torch.float32)
+                    break
+            else:
+                logging.warning(f'Warning: No face detected in image {str(i)}')
+                continue
+
+            # Align face
+            face_helper.clean_all()
+            face_helper.read_image(image[i])
+            face_helper.get_face_landmarks_5(only_center_face=True)
+            face_helper.align_warp_face()
+
+            if len(face_helper.cropped_faces) == 0:
+                continue
+
+            # Process face features
+            align_face = face_helper.cropped_faces[0]
+            align_face = image_to_tensor(align_face).unsqueeze(0).permute(0, 3, 1, 2).to(device)
+            parsing_out = face_helper.face_parse(functional.normalize(align_face, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]))[0]
+            parsing_out = parsing_out.argmax(dim=1, keepdim=True)
+            bg = sum(parsing_out == i for i in bg_label).bool()
+            white_image = torch.ones_like(align_face)
+            if use_gray:
+                _align_face = to_gray(align_face)
+            else:
+                _align_face = align_face
+            face_features_image = torch.where(bg, white_image, _align_face)
+
+            # Ensure face_features_image has the right type before passing to eva_clip
+            if hasattr(eva_clip, 'eval_device'):
+                model_device = eva_clip.eval_device
+            else:
+                model_device = device
+                
+            # Get the model's dtype by checking one of its parameters
+            model_dtype = None
+            for param in eva_clip.parameters():
+                model_dtype = param.dtype
+                break
+            
+            # Resize to EVA-CLIP expected dimensions
+            print(f"[PIP-PuLID-PRO] Resizing image from {face_features_image.shape[2:]} to {eva_clip.image_size}")
+            face_features_image = functional.resize(face_features_image, eva_clip.image_size, 
+                                                 transforms.InterpolationMode.BICUBIC if 'cuda' in device.type else transforms.InterpolationMode.NEAREST)
+            
+            # Normalize with model's mean and std                     
+            face_features_image = functional.normalize(face_features_image, eva_clip.image_mean, eva_clip.image_std)
+                
+            # Convert face image to the model's dtype
+            if model_dtype is not None:
+                print(f"[PIP-PuLID-PRO] Converting face image to {model_dtype}")
+                face_features_image = face_features_image.to(dtype=model_dtype)
+            else:
+                print("[PIP-PuLID-PRO] Could not determine model dtype, using default")
+            
+            # Ensure the image is on the correct device
+            face_features_image = face_features_image.to(device=model_device)
+            
+            # Get identity conditioning from EVA-CLIP
+            try:
+                print(f"[PIP-PuLID-PRO] Processing face image with shape {face_features_image.shape}, dtype {face_features_image.dtype}")
+                id_cond_vit, id_vit_hidden = eva_clip(face_features_image, return_all_features=False, return_hidden=True, shuffle=False)
+            except RuntimeError as e:
+                print(f"[PIP-PuLID-PRO] Error in EVA-CLIP processing: {e}")
+                # If there's a type error, try explicitly converting
+                if "type" in str(e).lower():
+                    try:
+                        print("[PIP-PuLID-PRO] Attempting explicit bfloat16 conversion")
+                        face_features_image = face_features_image.to(torch.bfloat16)
+                        id_cond_vit, id_vit_hidden = eva_clip(face_features_image, return_all_features=False, return_hidden=True, shuffle=False)
+                    except Exception as e2:
+                        print(f"[PIP-PuLID-PRO] Second attempt failed: {e2}")
+                        raise
+                else:
+                    raise
+            # 将输出转换为所需的数据类型
+            id_cond_vit = id_cond_vit.to(device, dtype=dtype)
+            for idx in range(len(id_vit_hidden)):
+                id_vit_hidden[idx] = id_vit_hidden[idx].to(device, dtype=dtype)
+
+            id_cond_vit = torch.div(id_cond_vit, torch.norm(id_cond_vit, 2, 1, True))
+
+            # Combine embeddings
+            id_cond = torch.cat([iface_embeds, id_cond_vit], dim=-1).to(dtype=dtype)
+
+            # Get PuLID Flux embeddings - ensure consistent data type
+            # Convert id_vit_hidden tensors to the right dtype before passing to get_embeds
+            id_vit_hidden_converted = []
+            for hidden in id_vit_hidden:
+                id_vit_hidden_converted.append(hidden.to(dtype=dtype))
+            
+            cond.append(pulid_flux.get_embeds(id_cond, id_vit_hidden_converted))
+        if not cond:
+            logging.warning("PuLID warning: No faces detected in the reference image.")
+            # Return a placeholder embedding instead of None to avoid errors
+            placeholder = torch.zeros((1, 1, 768), device=device, dtype=dtype)
+            return placeholder
+
+        # Apply fusion method
+        if fusion == "mean":
+            cond = torch.cat(cond).to(device, dtype=dtype)
+            if cond.shape[0] > 1:
+                cond = torch.mean(cond, dim=0, keepdim=True)
+        elif fusion == "concat":
+            cond = torch.cat(cond, dim=1).to(device, dtype=dtype)
+        elif fusion == "max":
+            cond = torch.cat(cond).to(device, dtype=dtype)
+            if cond.shape[0] > 1:
+                cond = torch.max(cond, dim=0, keepdim=True)[0]
+        elif fusion == "norm_id":
+            cond = torch.cat(cond).to(device, dtype=dtype)
+            if cond.shape[0] > 1:
+                norm = torch.norm(cond, dim=(1,2))
+                norm = norm / torch.sum(norm)
+                cond = torch.einsum("wij,w->ij", cond, norm).unsqueeze(0)
+        elif fusion == "max_token":
+            cond = torch.cat(cond).to(device, dtype=dtype)
+            if cond.shape[0] > 1:
+                norm = torch.norm(cond, dim=2)
+                _, idx = torch.max(norm, dim=0)
+                cond = torch.stack([cond[j,i] for i,j in enumerate(idx)]).unsqueeze(0)
+        elif fusion == "auto_weight":
+            cond = torch.cat(cond).to(device, dtype=dtype)
+            if cond.shape[0] > 1:
+                norm = torch.norm(cond, dim=2)
+                order = torch.argsort(norm, descending=False, dim=0)
+                regular_weight = torch.linspace(fusion_weight_min, fusion_weight_max, norm.shape[0]).to(device, dtype=dtype)
+
+                _cond = []
+                for i in range(cond.shape[1]):
+                    o = order[:,i]
+                    _cond.append(torch.einsum('ij,i->j', cond[:,i,:], regular_weight[o]))
+                cond = torch.stack(_cond, dim=0).unsqueeze(0)
+        elif fusion == "train_weight":
+            cond = torch.cat(cond).to(device, dtype=dtype)
+            if cond.shape[0] > 1:
+                if train_step > 0:
+                    with torch.inference_mode(False):
+                        cond = online_train(cond, device=cond.device, step=train_step)
+                else:
+                    cond = torch.mean(cond, dim=0, keepdim=True)
+        else:  # Default to mean if fusion method not recognized
+            cond = torch.cat(cond).to(device, dtype=dtype)
+            if cond.shape[0] > 1:
+                cond = torch.mean(cond, dim=0, keepdim=True)
+
+        return cond
+
+    def slerp(self, v0, v1, t, DOT_THRESHOLD=0.9995):
+        """球面线性插值 (Spherical Linear intERPolation) 函数
+        
+        Args:
+            v0: 起始矢量
+            v1: 终点矢量
+            t: 插值参数，范围[0, 1]
+            DOT_THRESHOLD: 点积阈值，当两向量接近平行时切换为线性插值
+            
+        Returns:
+            插值后的矢量
+        """
+        # 当t为0或10时的边界情况
+        if t <= 0:
+            return v0
+        elif t >= 1:
+            return v1
+            
+        # 当两个向量非常接近时使用线性插值
+        dot = torch.sum(v0 * v1 / (torch.norm(v0) * torch.norm(v1)))
+        if dot > DOT_THRESHOLD:
+            # 线性插值
+            return v0 * (1 - t) + v1 * t
+            
+        # 否则使用球面插值 (Slerp)
+        theta_0 = torch.acos(dot)
+        sin_theta_0 = torch.sin(theta_0)
+        theta_t = theta_0 * t
+        sin_theta_t = torch.sin(theta_t)
+        
+        # 球面插值公式
+        s0 = torch.sin(theta_0 - theta_t) / sin_theta_0
+        s1 = sin_theta_t / sin_theta_0
+        
+        return v0 * s0 + v1 * s1
+
+    def analyze_identity_difference(self, identity_embeds):
+        """分析多个身份嵌入之间的差异
+        
+        Args:
+            identity_embeds: 多个身份嵌入的字典，键为身份 ID
+            
+        Returns:
+            分析结果字典，包含相似度矩阵、关键特征等
+        """
+        # 如果少于两个身份，无需分析
+        if len(identity_embeds) < 2:
+            return {
+                "similarity_matrix": None,
+                "key_features": {},
+                "enhanced_embeddings": identity_embeds.copy()
+            }
+            
+        # 收集所有身份嵌入为列表
+        embeds_list = []
+        ids_list = []
+        for identity_id, embed in identity_embeds.items():
+            if embed is not None and isinstance(embed, torch.Tensor):
+                embeds_list.append(embed)
+                ids_list.append(identity_id)
+                
+        # 计算相似度矩阵
+        n = len(embeds_list)
+        similarity_matrix = torch.zeros((n, n))
+        
+        for i in range(n):
+            for j in range(i, n):
+                # 使用余弦相似度
+                cos_sim = F.cosine_similarity(embeds_list[i].unsqueeze(0), embeds_list[j].unsqueeze(0))
+                similarity_matrix[i, j] = cos_sim
+                similarity_matrix[j, i] = cos_sim  # 对称矩阵
+                
+        print(f"[DEBUG-PuLID] Identity similarity matrix:\n{similarity_matrix}")
+        
+        # 定位需要增强差异性的身份对
+        high_similarity_pairs = []
+        similarity_threshold = 0.85  # 阈值，超过这个值认为相似度过高
+        
+        for i in range(n):
+            for j in range(i+1, n):
+                if similarity_matrix[i, j] > similarity_threshold:
+                    high_similarity_pairs.append((i, j, similarity_matrix[i, j].item()))
+                    
+        print(f"[DEBUG-PuLID] Found {len(high_similarity_pairs)} high similarity pairs")
+        
+        # 分析身份嵌入的特征通道
+        key_features = {}
+        enhanced_embeddings = identity_embeds.copy()
+        
+        # 如果有需要增强差异性的身份
+        if high_similarity_pairs:
+            # 定位每个嵌入向量的关键特征通道
+            for idx, identity_id in enumerate(ids_list):
+                # 查找该身份参与的所有高相似度对
+                involved_pairs = [pair for pair in high_similarity_pairs if idx in (pair[0], pair[1])]
+                
+                if not involved_pairs:
+                    continue
+                    
+                # 获取当前嵌入
+                current_embed = embeds_list[idx]
+                
+                # 查找与其他身份的最大差异通道
+                feature_importance = torch.zeros_like(current_embed)
+                
+                for pair in involved_pairs:
+                    i, j, _ = pair
+                    other_idx = j if i == idx else i
+                    other_embed = embeds_list[other_idx]
+                    
+                    # 计算每个特征的差异程度
+                    diff = torch.abs(current_embed - other_embed)
+                    feature_importance += diff
+                
+                # 选出前30%的最重要特征
+                top_k = int(current_embed.shape[0] * 0.3)  # 选前30%
+                _, top_indices = torch.topk(feature_importance, top_k)
+                
+                # 存储关键特征索引
+                key_features[identity_id] = top_indices.tolist()
+                
+                # 增强这些关键特征
+                enhanced_embed = current_embed.clone()
+                enhancement_factor = 1.5  # 增强因子
+                enhanced_embed[top_indices] *= enhancement_factor
+                
+                # 重新标准化
+                enhanced_embed = F.normalize(enhanced_embed, p=2, dim=0)
+                
+                # 更新增强的嵌入
+                enhanced_embeddings[identity_id] = enhanced_embed
+                
+                print(f"[DEBUG-PuLID] Enhanced key features for identity {identity_id}")
+        
+        return {
+            "similarity_matrix": similarity_matrix,
+            "key_features": key_features,
+            "enhanced_embeddings": enhanced_embeddings
+        }
+    
+    def identity_slerp(self, embeds_list, weights_list, smooth_factor=0.3):
+        """使用Slerp插值混合多个身份嵌入
+        
+        Args:
+            embeds_list: 身份嵌入向量列表
+            weights_list: 对应的权重列表
+            smooth_factor: 平滑因子，控制Slerp混合程度
+            
+        Returns:
+            混合后的嵌入向量
+        """
+        # 如果只有一个嵌入，直接返回
+        if len(embeds_list) == 1:
+            return embeds_list[0]
+            
+        # 对权重进行标准化
+        total_weight = sum(weights_list)
+        if total_weight > 0:
+            weights_list = [w / total_weight for w in weights_list]
+        else:
+            return embeds_list[0]  # 默认返回第一个
+            
+        # 二元Slerp
+        if len(embeds_list) == 2:
+            # 计算插值参数
+            t = weights_list[1]  # 使用第二个嵌入的权重作为插值参数
+            
+            # 应用平滑因子，使插值更平滑
+            t_smooth = t * (1 - smooth_factor) + 0.5 * smooth_factor
+            
+            return self.slerp(embeds_list[0], embeds_list[1], t_smooth)
+            
+        # 多元Slerp，通过递归方式实现
+        # 按权重对每个嵌入进行排序
+        paired_embeds = list(zip(embeds_list, weights_list))
+        sorted_embeds = sorted(paired_embeds, key=lambda x: x[1], reverse=True)
+        
+        # 递归应用Slerp混合
+        result = sorted_embeds[0][0]  # 开始使用权重最大的嵌入
+        
+        for i in range(1, len(sorted_embeds)):
+            current_embed = sorted_embeds[i][0]
+            current_weight = sorted_embeds[i][1]
+            
+            # 计算当前嵌入在总权重中的占比
+            # 之前处理过的权重和
+            previous_weights_sum = sum([sorted_embeds[j][1] for j in range(i)])
+            proportion = current_weight / (previous_weights_sum + current_weight)
+            
+            # 应用平滑因子
+            proportion_smooth = proportion * (1 - smooth_factor) + smooth_factor / len(sorted_embeds)
+            
+            result = self.slerp(result, current_embed, proportion_smooth)
+            
+        return result
+        
+    def enhance_person_token_mapping(self, prompt_text, person_tokens):
+        """增强人物标记与文本的映射关系，捕获人物位置和外观描述
+        
+        Args:
+            prompt_text (str): 完整的提示文本
+            person_tokens (dict): 人物ID到令牌的映射
+            
+        Returns:
+            dict: 增强的人物令牌信息，包含上下文和描述词
+        """
+        enhanced_tokens = {}
+        
+        for person_id, token in person_tokens.items():
+            if not token or token not in prompt_text:
+                continue
+                
+            # 创建扩展上下文
+            token_pos = prompt_text.find(token)
+            if token_pos < 0:
+                continue
+                
+            # 查找周围的描述性词汇（前后25个字符）
+            context_window = 25  
+            start = max(0, token_pos - context_window)
+            end = min(len(prompt_text), token_pos + len(token) + context_window)
+            
+            context = prompt_text[start:end]
+            
+            # Search for specific types of descriptors
+            descriptors = {
+                "appearance": ["wearing", "with", "dressed", "has", "in", "hat", "glasses", "hair", "beard", "outfit"], 
+                "position": ["left", "right", "center", "background", "foreground", "behind", "front", "beside", "above", "below"],
+                "action": ["sitting", "standing", "looking", "smiling", "facing", "talking", "walking", "running", "dancing", "posing"],
+                "orientation": ["profile", "side", "front", "turned", "posed", "view", "angle", "direction", "portrait", "landscape"]
+            }
+            
+            # 收集所有匹配的描述词
+            found_descriptors = {}
+            for category, words in descriptors.items():
+                for word in words:
+                    word_pos = context.find(word)
+                    if word_pos >= 0:
+                        # 检查这个词是否是token的一部分
+                        token_start_in_context = token_pos - start
+                        token_end_in_context = token_start_in_context + len(token)
+                        
+                        # 只有当词不在token内时才考虑它
+                        if word_pos < token_start_in_context or word_pos >= token_end_in_context:
+                            if category not in found_descriptors:
+                                found_descriptors[category] = []
+                            
+                            # 获取词周围的一小段上下文
+                            word_context_start = max(0, word_pos - 5)
+                            word_context_end = min(len(context), word_pos + len(word) + 15)
+                            word_with_context = context[word_context_start:word_context_end].strip()
+                            
+                            found_descriptors[category].append({
+                                "word": word,
+                                "context": word_with_context
+                            })
+            
+            # 创建增强的标记
+            enhanced_tokens[person_id] = {
+                "base_token": token,
+                "context": context,
+                "descriptors": found_descriptors
+            }
+            
+            print(f"[PIP-PuLID-PRO] Enhanced token '{token}' with context information:")
+            for category, items in found_descriptors.items():
+                if items:
+                    print(f"  - {category}: {', '.join([item['word'] for item in items])}")
+        
+        return enhanced_tokens
+    
+    def __del__(self):
+        # Clean up resources when the node is deleted
+        if hasattr(self, 'pulid_data_dict'):
+            for unique_id, data in self.pulid_data_dict.items():
+                if unique_id in data['data']:
+                    del data['data'][unique_id]
+            del self.pulid_data_dict
+
+
+# Update NODE_CLASS_MAPPINGS to include the new PRO node
+NODE_CLASS_MAPPINGS = {
+    "PipApplyPulidFluxPro": PipApplyPulidFluxPro,  # New PRO node with multi-person support
+}
+
+# Update display names
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "PipApplyPulidFluxPro": "Apply PIP PuLID Flux PRO",  # Display name for new PRO node
+}
