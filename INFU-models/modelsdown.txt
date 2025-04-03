@@ -1,0 +1,1 @@
+https://huggingface.co/ByteDance/InfiniteYou/tree/main/infu_flux_v1.0
