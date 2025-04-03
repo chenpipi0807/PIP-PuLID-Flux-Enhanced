@@ -29,9 +29,9 @@
 
 - **自适应方法**在需要保持提示和参考图像之间明显姿势差异时效果最佳。它特别适合于较强的引导比例。
 
-- **残差方法**通常提供最高的身份保真度，同时仍然允许姿势变化。尝试在权重为0.9-1.1时使用此方法。
+- **残差方法**通常提供最高的身份保真度，同时仍然允许姿势变化。尝试在权重为1.5-2.5时使用此方法。
 
-- **增强残差方法**使用先进的深度学习模型处理图像，在保持身份的同时提供更自然的姿势变化。推荐权重0.8-1.0。
+- **增强残差方法**使用先进的深度学习模型处理图像，在保持身份的同时提供更自然的姿势变化。推荐权重1.5-2.5。
 
 ## 解决的问题
 
@@ -75,27 +75,18 @@
 
 ## 目录结构：
 
-INFU-models:
-├─aes_stage2
-│  │  image_proj_model.bin
-│  │  
-│  └─InfuseNetModel
-│          config.json
-│          diffusion_pytorch_model-00001-of-00002.safetensors
-│          diffusion_pytorch_model-00002-of-00002.safetensors
-│          diffusion_pytorch_model.safetensors.index.json
-│
-└─sim_stage1
-    │  image_proj_model.bin
-    │  
-    └─InfuseNetModel
-            config.json
-            diffusion_pytorch_model-00001-of-00002.safetensors
-            diffusion_pytorch_model-00002-of-00002.safetensors
-            diffusion_pytorch_model.safetensors.index.json
-
-(base) PS C:\COMFYUI\ComfyUI_windows_portable\ComfyUI\custom_nodes\ComfyUI-PuLID-Flux-Enhanced\INFU-models> 
-
-
-
-
+INFU-models/
+├── aes_stage2/
+│   ├── image_proj_model.bin
+│   └── InfuseNetModel/
+│       ├── config.json
+│       ├── diffusion_pytorch_model-00001-of-00002.safetensors
+│       ├── diffusion_pytorch_model-00002-of-00002.safetensors
+│       └── diffusion_pytorch_model.safetensors.index.json
+└── sim_stage1/
+    ├── image_proj_model.bin
+    └── InfuseNetModel/
+        ├── config.json
+        ├── diffusion_pytorch_model-00001-of-00002.safetensors
+        ├── diffusion_pytorch_model-00002-of-00002.safetensors
+        └── diffusion_pytorch_model.safetensors.index.json
