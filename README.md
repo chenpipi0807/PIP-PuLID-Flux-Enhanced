@@ -53,6 +53,7 @@
    - 将下载的文件放入`custom_nodes/ComfyUI-PuLID-Flux-Enhanced/INFU-models`文件夹
    - 确保文件结构为：`sim_stage1/image_proj_model.bin`和`aes_stage2/image_proj_model.bin`
 3. 重启 ComfyUI
+4. 调整权重参数（residual_infu和residual推荐1.5-2.5之间）来达到理想的效果
 
 ### 使用
 
@@ -72,5 +73,29 @@
 ![微信截图_20250403112639](https://github.com/user-attachments/assets/2ad41784-5194-44b8-a525-ae12ed1fdef7)
 
 
+## 目录结构：
 
-4. 调整权重参数（residual_infu和residual推荐1.5-2.5之间）来达到理想的效果
+INFU-models:
+├─aes_stage2
+│  │  image_proj_model.bin
+│  │  
+│  └─InfuseNetModel
+│          config.json
+│          diffusion_pytorch_model-00001-of-00002.safetensors
+│          diffusion_pytorch_model-00002-of-00002.safetensors
+│          diffusion_pytorch_model.safetensors.index.json
+│
+└─sim_stage1
+    │  image_proj_model.bin
+    │  
+    └─InfuseNetModel
+            config.json
+            diffusion_pytorch_model-00001-of-00002.safetensors
+            diffusion_pytorch_model-00002-of-00002.safetensors
+            diffusion_pytorch_model.safetensors.index.json
+
+(base) PS C:\COMFYUI\ComfyUI_windows_portable\ComfyUI\custom_nodes\ComfyUI-PuLID-Flux-Enhanced\INFU-models> 
+
+
+
+
