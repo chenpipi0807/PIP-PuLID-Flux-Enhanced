@@ -13,11 +13,18 @@ from insightface.app import FaceAnalysis
 from facexlib.parsing import init_parsing_model
 from facexlib.utils.face_restoration_helper import FaceRestoreHelper
 import torch.nn.functional as F
+from PIL import Image
 
 # Import everything from the original pulidflux module for consistent functionality
 from .pulidflux import PulidFluxModelLoader, PulidFluxInsightFaceLoader, PulidFluxEvaClipLoader, ApplyPulidFlux
 from .pulidflux import tensor_to_image, image_to_tensor, resize_with_pad, to_gray
 from .pulidflux import forward_orig, online_train
+
+# Import the InfuseNet model adapter
+from .infu_models import InfuseNetManager
+
+# Path to the InfuseNet models
+INFU_MODELS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "INFU-models")
 
 
 class PipApplyPulidFlux(ApplyPulidFlux):
@@ -382,27 +389,83 @@ class PipApplyPulidFlux(ApplyPulidFlux):
                                         img = img + node_data['weight'] * orthogonal.to(img.dtype)
                                         print(f"[PIP-PuLID-DEBUG] adaptive = {method}, = {uid}")
                                     elif 'residual' in node_data and node_data['residual']:
-                                        # residual - 
-                                        img_float = img.to(dtype=torch.float32)
-                                        attn_float = orig_attn_result.to(dtype=torch.float32)
-                                        
-                                        # 
-                                        img_features = img_float.mean(dim=1, keepdim=True)  # 
-                                        attn_features = attn_float.mean(dim=1, keepdim=True)
-                                        
-                                        # 
-                                        corr = torch.abs(img_features * attn_features).mean(dim=1, keepdim=True) 
-                                        norm_corr = (corr - corr.min()) / (corr.max() - corr.min() + 1e-8)
-                                        
-                                        # 
-                                        identity_mask = (norm_corr > 0.4).float()  # 
-                                        
-                                        # 
-                                        identity_features = attn_float * (identity_mask * 1.5 + 0.2)  # 
-                                        
-                                        # 
-                                        img = img + node_data['weight'] * 1.2 * identity_features.to(img.dtype)  # 
-                                        print(f"[PIP-PuLID-DEBUG] - residual {method}, = {uid}")
+                                        if 'use_infu' in node_data and node_data['use_infu']:
+                                            # InfuseNet增强版residual方法
+                                            img_float = img.to(dtype=torch.float32)
+                                            attn_float = orig_attn_result.to(dtype=torch.float32)
+                                            
+                                            # 如果有INFU嵌入，直接使用预处理好的特征
+                                            if 'infu_embeds' in node_data and node_data['infu_embeds'] is not None:
+                                                # 确保嵌入是3D格式 [batch_size, sequence_length, embedding_dim]
+                                                infu_embeds = node_data['infu_embeds']
+                                                if infu_embeds.dim() == 2:
+                                                    # 如果是两维形状 [batch_size, embedding_dim]，转换为 [batch_size, 1, embedding_dim]
+                                                    infu_embeds = infu_embeds.unsqueeze(1)
+                                                    print(f"[PIP-PuLID-DEBUG] Reshaped InfuseNet embeddings to 3D: {infu_embeds.shape}")
+                                                
+                                                # 在传递给交叉注意力机制前再次检查形状
+                                                if infu_embeds.dim() != 3:
+                                                    print(f"[PIP-PuLID-DEBUG] InfuseNet embeddings still don't have 3 dimensions: {infu_embeds.shape}")
+                                                    # 如果还不是3D，创建一个适当形状的占位符
+                                                    infu_embeds = torch.zeros((1, 1, 2048), device=img.device, dtype=img.dtype)
+                                                
+                                                # 调用交叉注意力机制
+                                                infu_attn = self.pulid_ca[ca_idx](infu_embeds, img)
+                                                infu_attn = infu_attn.to(dtype=torch.float32)
+                                                
+                                                # 提取特征均值
+                                                img_features = img_float.mean(dim=1, keepdim=True)
+                                                infu_features = infu_attn.mean(dim=1, keepdim=True)
+                                                
+                                                # 计算相关性并生成动态权重
+                                                corr = torch.abs(img_features * infu_features).mean(dim=1, keepdim=True)
+                                                norm_corr = (corr - corr.min()) / (corr.max() - corr.min() + 1e-8)
+                                                
+                                                # 使用sigmoid函数生成平滑的权重，而不是硬阈值
+                                                importance_weight = torch.sigmoid((norm_corr - 0.2) * 8) * 0.7 + 0.3
+                                                
+                                                # 组合原始特征和INFU特征
+                                                combined_attention = (attn_float * 0.4 + infu_attn * 0.6) * importance_weight
+                                                
+                                                # 应用组合特征
+                                                img = img + node_data['weight'] * 1.5 * combined_attention.to(img.dtype)
+                                                print(f"[PIP-PuLID-DEBUG] InfuseNet enhanced residual {method}, = {uid}")
+                                            else:
+                                                # 如果没有INFU嵌入，退回到改进版residual方法
+                                                # 提取特征均值用于相关性计算
+                                                img_features = img_float.mean(dim=1, keepdim=True)
+                                                attn_features = attn_float.mean(dim=1, keepdim=True)
+                                                
+                                                # 计算相关性并归一化
+                                                corr = torch.abs(img_features * attn_features).mean(dim=1, keepdim=True) 
+                                                norm_corr = (corr - corr.min()) / (corr.max() - corr.min() + 1e-8)
+                                                
+                                                identity_mask = (norm_corr > 0.35).float()
+                                                identity_features = attn_float * (identity_mask * 1.7 + 0.25)
+                                                img = img + node_data['weight'] * 1.3 * identity_features.to(img.dtype)
+                                                print(f"[PIP-PuLID-DEBUG] - improved residual fallback {method}, = {uid}")
+                                        else:
+                                            # 原始改进版residual方法
+                                            img_float = img.to(dtype=torch.float32)
+                                            attn_float = orig_attn_result.to(dtype=torch.float32)
+                                            
+                                            # 提取特征均值用于相关性计算
+                                            img_features = img_float.mean(dim=1, keepdim=True)
+                                            attn_features = attn_float.mean(dim=1, keepdim=True)
+                                            
+                                            # 计算相关性并归一化
+                                            corr = torch.abs(img_features * attn_features).mean(dim=1, keepdim=True) 
+                                            norm_corr = (corr - corr.min()) / (corr.max() - corr.min() + 1e-8)
+                                            
+                                            # 使用稍微低一点的阈值，提高身份检测覆盖范围
+                                            identity_mask = (norm_corr > 0.35).float()
+                                            
+                                            # 稍微提高权重
+                                            identity_features = attn_float * (identity_mask * 1.7 + 0.25)
+                                            
+                                            # 应用特征
+                                            img = img + node_data['weight'] * 1.3 * identity_features.to(img.dtype)
+                                            print(f"[PIP-PuLID-DEBUG] - improved residual {method}, = {uid}")
                                     else:
                                         # neutral
                                         img = img + node_data['weight'] * orig_attn_result
@@ -520,27 +583,69 @@ class PipApplyPulidFlux(ApplyPulidFlux):
                                         real_img = real_img + node_data['weight'] * orthogonal.to(real_img.dtype)
                                         print(f"[PIP-PuLID-DEBUG] adaptive = {method}, = {uid}")
                                     elif 'residual' in node_data and node_data['residual']:
-                                        # residual - 
-                                        real_img_float = real_img.to(dtype=torch.float32)
-                                        attn_float = orig_attn_result.to(dtype=torch.float32)
-                                        
-                                        # 
-                                        img_features = real_img_float.mean(dim=1, keepdim=True)  # 
-                                        attn_features = attn_float.mean(dim=1, keepdim=True)
-                                        
-                                        # 
-                                        corr = torch.abs(img_features * attn_features).mean(dim=1, keepdim=True) 
-                                        norm_corr = (corr - corr.min()) / (corr.max() - corr.min() + 1e-8)
-                                        
-                                        # 
-                                        identity_mask = (norm_corr > 0.4).float()  # 
-                                        
-                                        # 
-                                        identity_features = attn_float * (identity_mask * 1.5 + 0.2)  # 
-                                        
-                                        # 
-                                        real_img = real_img + node_data['weight'] * 1.2 * identity_features.to(real_img.dtype)  # 
-                                        print(f"[PIP-PuLID-DEBUG] - residual {method}, = {uid}")
+                                        if 'use_infu' in node_data and node_data['use_infu']:
+                                            # InfuseNet增强版residual方法
+                                            real_img_float = real_img.to(dtype=torch.float32)
+                                            attn_float = orig_attn_result.to(dtype=torch.float32)
+                                            
+                                            # 如果有INFU嵌入，直接使用预处理好的特征
+                                            if 'infu_embeds' in node_data and node_data['infu_embeds'] is not None:
+                                                infu_attn = self.pulid_ca[ca_idx](node_data['infu_embeds'], real_img)
+                                                infu_attn = infu_attn.to(dtype=torch.float32)
+                                                
+                                                # 提取特征均值
+                                                img_features = real_img_float.mean(dim=1, keepdim=True)
+                                                infu_features = infu_attn.mean(dim=1, keepdim=True)
+                                                
+                                                # 计算相关性并生成动态权重
+                                                corr = torch.abs(img_features * infu_features).mean(dim=1, keepdim=True)
+                                                norm_corr = (corr - corr.min()) / (corr.max() - corr.min() + 1e-8)
+                                                
+                                                # 使用sigmoid函数生成平滑的权重，而不是硬阈值
+                                                importance_weight = torch.sigmoid((norm_corr - 0.2) * 8) * 0.7 + 0.3
+                                                
+                                                # 组合原始特征和INFU特征
+                                                combined_attention = (attn_float * 0.4 + infu_attn * 0.6) * importance_weight
+                                                
+                                                # 应用组合特征
+                                                real_img = real_img + node_data['weight'] * 1.5 * combined_attention.to(real_img.dtype)
+                                                print(f"[PIP-PuLID-DEBUG] InfuseNet enhanced residual {method}, = {uid}")
+                                            else:
+                                                # 如果没有INFU嵌入，退回到改进版residual方法
+                                                # 提取特征均值用于相关性计算
+                                                img_features = real_img_float.mean(dim=1, keepdim=True)
+                                                attn_features = attn_float.mean(dim=1, keepdim=True)
+                                                
+                                                # 计算相关性并归一化
+                                                corr = torch.abs(img_features * attn_features).mean(dim=1, keepdim=True) 
+                                                norm_corr = (corr - corr.min()) / (corr.max() - corr.min() + 1e-8)
+                                                
+                                                identity_mask = (norm_corr > 0.35).float()
+                                                identity_features = attn_float * (identity_mask * 1.7 + 0.25)
+                                                real_img = real_img + node_data['weight'] * 1.3 * identity_features.to(real_img.dtype)
+                                                print(f"[PIP-PuLID-DEBUG] - improved residual fallback {method}, = {uid}")
+                                        else:
+                                            # 原始改进版residual方法
+                                            real_img_float = real_img.to(dtype=torch.float32)
+                                            attn_float = orig_attn_result.to(dtype=torch.float32)
+                                            
+                                            # 提取特征均值用于相关性计算
+                                            img_features = real_img_float.mean(dim=1, keepdim=True)
+                                            attn_features = attn_float.mean(dim=1, keepdim=True)
+                                            
+                                            # 计算相关性并归一化
+                                            corr = torch.abs(img_features * attn_features).mean(dim=1, keepdim=True) 
+                                            norm_corr = (corr - corr.min()) / (corr.max() - corr.min() + 1e-8)
+                                            
+                                            # 使用稍微低一点的阈值，提高身份检测覆盖范围
+                                            identity_mask = (norm_corr > 0.35).float()
+                                            
+                                            # 稍微提高权重
+                                            identity_features = attn_float * (identity_mask * 1.7 + 0.25)
+                                            
+                                            # 应用特征
+                                            real_img = real_img + node_data['weight'] * 1.3 * identity_features.to(real_img.dtype)
+                                            print(f"[PIP-PuLID-DEBUG] - improved residual {method}, = {uid}")
                                     else:
                                         # neutral
                                         real_img = real_img + node_data['weight'] * orig_attn_result
@@ -588,13 +693,157 @@ class PipApplyPulidFlux(ApplyPulidFlux):
             del self.pulid_data_dict
 
 
-# Update NODE_CLASS_MAPPINGS to include the new node
+class PipApplyPulidFluxPro(PipApplyPulidFlux):
+    """Enhanced version of PipApplyPulidFlux with InfuseNet integration for residual method
+    
+    This class extends PipApplyPulidFlux to include the InfuseNet models from InfiniteYou
+    for improved identity transfer when using the residual method.
+    """
+    @classmethod
+    def INPUT_TYPES(s):
+        input_types = PipApplyPulidFlux.INPUT_TYPES()
+        # 修改method选项列表以包含新的InfuseNet方法
+        input_types["required"]["method"] = (["fidelity", "adaptive", "residual", "residual_infu"],)
+        return input_types
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "apply_pip_pulid_flux_pro"
+    CATEGORY = "pulid"
+    
+    def __init__(self):
+        super().__init__()
+        self.infu_manager = None
+        
+    def load_infu_manager(self, device, dtype):
+        """加载InfuseNet模型管理器"""
+        try:
+            if self.infu_manager is None:
+                print(f"Loading InfuseNet manager from {INFU_MODELS_PATH}")
+                self.infu_manager = InfuseNetManager(INFU_MODELS_PATH, device)
+                self.infu_manager.load_models()
+                self.infu_manager.to(device, dtype)
+                print("InfuseNet manager loaded successfully")
+            return self.infu_manager
+        except Exception as e:
+            print(f"Error loading InfuseNet manager: {str(e)}")
+            return None
+            
+    def apply_pip_pulid_flux_pro(self, model, pulid_flux, eva_clip, face_analysis, image, method, weight, start_at, end_at, 
+                           prior_image=None, fusion=None, fusion_weight_max=1.0, fusion_weight_min=0.0, 
+                           train_step=1000, use_gray=True, attn_mask=None, unique_id=None):
+        # Get device and dtype
+        device = comfy.model_management.get_torch_device()
+        dtype = model.model.diffusion_model.dtype
+        if dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+            dtype = torch.bfloat16
+        
+        try:
+            # 设置使用InfuseNet的标志
+            use_infu = method == "residual_infu"
+            
+            # 如果选择了InfuseNet方法，将method设为residual以重用现有的检查分支
+            orig_method = method
+            if method == "residual_infu":
+                method = "residual"
+                print(f"Using 'residual_infu' method with InfiniteYou enhancement")
+            
+            # 处理参考图像以获取InfuseNet嵌入
+            infu_embeds = None
+            if use_infu:
+                try:
+                    # 确保加载InfuseNet模型
+                    infu_manager = self.load_infu_manager(device, dtype)
+                    
+                    # 将图像转换为PIL图像以供InfuseNet处理
+                    img_np = tensor_to_image(image)[0]
+                    img_pil = Image.fromarray(img_np)
+                    
+                    # 获取增强的嵌入
+                    print("Processing image with InfiniteYou models...")
+                    infu_embeds = infu_manager.get_enhanced_embeddings(img_pil)
+                    infu_embeds = infu_embeds.to(device, dtype=dtype)
+                    print(f"Successfully created InfuseNet embeddings with shape: {infu_embeds.shape}")
+                except Exception as e:
+                    print(f"Error processing image with InfuseNet: {str(e)}")
+                    print("Falling back to standard residual method")
+                    infu_embeds = None
+            
+            # 调用基类方法处理大部分逻辑
+            result = super().apply_pip_pulid_flux(model, pulid_flux, eva_clip, face_analysis, image, method, weight, start_at, end_at,
+                                               prior_image, fusion, fusion_weight_max, fusion_weight_min, 
+                                               train_step, use_gray, attn_mask, unique_id)
+            
+            # 如果使用InfuseNet，且成功生成了嵌入，更新模型中的节点数据
+            if use_infu and infu_embeds is not None and hasattr(self, 'pulid_data_dict'):
+                try:
+                    flux_model = model.model.diffusion_model
+                    uid = self.pulid_data_dict['unique_id']
+                    if uid in flux_model.pulid_data:
+                        # 检查嵌入维度是否正确
+                        expected_size = 2048
+                        if infu_embeds.shape[1] != expected_size:
+                            print(f"Warning: InfuseNet embedding size {infu_embeds.shape[1]} doesn't match expected size {expected_size}")
+                            if infu_embeds.shape[1] < expected_size:
+                                # 如果维度不够，补充到正确大小
+                                padded_embeds = torch.zeros((infu_embeds.shape[0], expected_size), 
+                                                           device=infu_embeds.device, dtype=infu_embeds.dtype)
+                                padded_embeds[:, :infu_embeds.shape[1]] = infu_embeds
+                                infu_embeds = padded_embeds
+                            else:
+                                # 如果维度太大，截取到正确大小
+                                infu_embeds = infu_embeds[:, :expected_size]
+                        
+                        # 将2D嵌入 [1, 2048] 转换为期望的3D格式 [1, seq_len, 2048]
+                        # Cross-attention期望形状为 [batch_size, sequence_length, embedding_dim]
+                        # 这里我们使用seq_len=1，表示一个单独的token/embedding
+                        if infu_embeds.dim() == 2:
+                            # 将 [batch_size, embedding_dim] 转换为 [batch_size, 1, embedding_dim]
+                            infu_embeds = infu_embeds.unsqueeze(1)
+                            print(f"Reshaped InfuseNet embeddings to 3D tensor with shape: {infu_embeds.shape}")
+                        
+                        # 检查是否有NaN或无限值
+                        if torch.isnan(infu_embeds).any() or torch.isinf(infu_embeds).any():
+                            print("Warning: Found NaN or infinite values in InfuseNet embeddings, replacing with zeros")
+                            infu_embeds = torch.where(torch.isnan(infu_embeds) | torch.isinf(infu_embeds), 
+                                                    torch.zeros_like(infu_embeds), 
+                                                    infu_embeds)
+                        
+                        # 更新模型数据
+                        flux_model.pulid_data[uid]['use_infu'] = True
+                        flux_model.pulid_data[uid]['infu_embeds'] = infu_embeds
+                        print(f"Added InfuseNet embeddings with shape {infu_embeds.shape} to node with UID {uid}")
+                except Exception as e:
+                    print(f"Error adding InfuseNet embeddings to model: {str(e)}")
+            elif use_infu and infu_embeds is None and hasattr(self, 'pulid_data_dict'):
+                print(f"Using regular residual method instead of 'residual_infu' due to embedding generation failure.")
+            
+            return result
+        except Exception as e:
+            print(f"Error in apply_pip_pulid_flux_pro: {str(e)}")
+            # 发生错误时，回退到基类方法
+            print("Falling back to standard PipApplyPulidFlux...")
+            # 确保使用原始方法名，但如果是residual_infu，则转换为residual
+            if method == "residual_infu":
+                method = "residual"
+            return super().apply_pip_pulid_flux(model, pulid_flux, eva_clip, face_analysis, image, method, weight, start_at, end_at,
+                                           prior_image, fusion, fusion_weight_max, fusion_weight_min, 
+                                           train_step, use_gray, attn_mask, unique_id)
+        
+    def __del__(self):
+        # 清理资源
+        super().__del__()
+        if hasattr(self, 'infu_manager') and self.infu_manager is not None:
+            del self.infu_manager
+        
+
+# Update NODE_CLASS_MAPPINGS to include the new nodes
 NODE_CLASS_MAPPINGS = {
     "PulidFluxModelLoader": PulidFluxModelLoader,  # Include original nodes
     "PulidFluxInsightFaceLoader": PulidFluxInsightFaceLoader,
     "PulidFluxEvaClipLoader": PulidFluxEvaClipLoader,
     "ApplyPulidFlux": ApplyPulidFlux,  # Original node
-    "PipApplyPulidFlux": PipApplyPulidFlux,  # New enhanced node
+    "PipApplyPulidFlux": PipApplyPulidFlux,  # Enhanced node
+    "PipApplyPulidFluxPro": PipApplyPulidFluxPro,  # Pro node with InfuseNet
 }
 
 # Update display names
@@ -603,5 +852,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PulidFluxInsightFaceLoader": "Load InsightFace (PuLID Flux)",
     "PulidFluxEvaClipLoader": "Load Eva Clip (PuLID Flux)",
     "ApplyPulidFlux": "Apply PuLID Flux",
-    "PipApplyPulidFlux": "Apply PIP PuLID Flux",  # Display name for new node
+    "PipApplyPulidFlux": "Apply PIP PuLID Flux",  # Display name for enhanced node
+    "PipApplyPulidFluxPro": "Apply PIP PuLID Flux PRO",  # Display name for pro node
 }
